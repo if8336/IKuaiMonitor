@@ -2,6 +2,12 @@
 # 爱快软路由性能监视器
 > 本项目是基于路由监视器 [shelo/RouterMonitor](https://gitee.com/dannylsl/routermonitor) 的二次开发，通过构造登录请求，实现了对爱快软路由的原生支持，同时支持新版netdata。
 
+# 先上图
+
+
+| 爱快监控效果                                 |
+|----------------------------------------|
+| ![ikuai-mo.jpeg](./images/ikuai-mo.jpeg) |
 # 获取爱快登录凭据
 浏览器登录爱快路由器，F12 network选项卡查找login请求，在payload里，点击view parsed，将加密的json串完全复制，填写到项目里的ikuaiToken变量里。
 
