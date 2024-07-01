@@ -1,6 +1,7 @@
 ## 前言
 # 爱快软路由性能监视器
-> 本项目是基于路由监视器 [shelo/RouterMonitor](https://gitee.com/dannylsl/routermonitor) 的二次开发，通过构造登录请求，实现了对爱快软路由的原生支持，同时支持新版netdata。
+> 本项目是基于路由监视器 [shelo/RouterMonitor](https://gitee.com/dannylsl/routermonitor) 的二次开发，通过构造登录请求，实现了对爱快软路由的原生支持，
+> 对于openwrt、linux服务器、NAS操作系统等，支持通过docker容器netdata获取数据源。
 
 # 先上图
 
