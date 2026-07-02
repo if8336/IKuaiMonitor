@@ -9,13 +9,13 @@ using namespace std;
 
 //是否通过爱快接口获得数据
 constexpr bool isIkuai = true;
-// 连接WiFi名
-const char* ssid = "xiaomi-";
-// 连接WiFi密码
-const char* password = "12345678";
-// 爱快身份认证信息，用于获取cookie
-const char* ikuaiToken =
-    "{\"username\":\"sd2\",\"passwd\":\"asfoisjdfoicmjuiore\",\"pass\":\"asgkgjkals==\",\"remember_password\":\"true\"}";
+// 连接WiFi名（请改为你的 WiFi 名称）
+const char* ssid = "YourWiFi-SSID";
+// 连接WiFi密码（请改为你的 WiFi 密码）
+const char* password = "your-wifi-password";
+// 爱快路由器登录凭据（请改为你的账号密码）
+const char* ikuaiUsername = "admin";
+const char* ikuaiPassword = "your-password";
 
 // extern lv_font_t my_font_name;
 LV_FONT_DECLARE(tencent_w7_22)
@@ -76,9 +76,8 @@ void my_print(lv_log_level_t level, const char *file, uint32_t line, const char 
 
 // 屏幕亮度设置，value [0, 256] 越小月亮,越大越暗
 void setBrightness(int value) {
-    pinMode(TFT_BL, INPUT);
-    analogWrite(TFT_BL, value);
     pinMode(TFT_BL, OUTPUT);
+    analogWrite(TFT_BL, value);
 }
 
 // 页面初始化
@@ -112,30 +111,42 @@ void initLoginPage()
     lv_obj_align(preload, NULL, LV_ALIGN_CENTER, 0, 0);
 }
 
-// 连接WiFi
-void connectWiFi()
+// 连接WiFi（非阻塞，带15秒超时）
+bool connectWiFi()
 {
-    WiFi.begin(ssid, password);     // 启动网络连接
-    Serial.print("Connecting to "); // 串口监视器输出网络连接信息
-    Serial.print(ssid);
-    Serial.println(" ..."); // 告知用户NodeMCU正在尝试WiFi连接
-
-    int i = 0; // 这一段程序语句用于检查WiFi是否连接成功
-    while (WiFi.status() != WL_CONNECTED)
-    {                // WiFi.status()函数的返回值是由NodeMCU的WiFi连接状态所决定的。
-        delay(1000); // 如果WiFi连接成功则返回值为WL_CONNECTED
-        Serial.print(i++);
-        Serial.print(' '); // 此处通过While循环让NodeMCU每隔一秒钟检查一次WiFi.status()函数返回值
-    }                      // 同时NodeMCU将通过串口监视器输出连接时长读秒。
-                           // 这个读秒是通过变量i每隔一秒自加1来实现的。
-    // wifi验证成功，切换到monitor页面
-    lv_obj_set_hidden(login_page, true);
-    lv_obj_set_hidden(monitor_page, false);
-
-    Serial.println("");                                // WiFi连接成功后
-    Serial.println("Connection established!");         // NodeMCU将通过串口监视器输出"连接成功"信息。
-    Serial.print("IP address:    ");                   // 同时还将输出NodeMCU的IP地址。这一功能是通过调用
-    Serial.println(WiFi.localIP().toString().c_str()); // WiFi.localIP()函数来实现的。该函数的返回值即NodeMCU的IP地址。
+    // WiFi 已连接时切换页面并返回
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        static bool pageSwitched = false;
+        if (!pageSwitched)
+        {
+            pageSwitched = true;
+            lv_obj_set_hidden(login_page, true);
+            lv_obj_set_hidden(monitor_page, false);
+            Serial.println("");
+            Serial.println("Connection established!");
+            Serial.print("IP address:    ");
+            Serial.println(WiFi.localIP().toString().c_str());
+        }
+        return true;
+    }
+    static unsigned long lastAttempt = 0;
+    static bool connecting = false;
+    if (!connecting)
+    {
+        Serial.print("Connecting to ");
+        Serial.print(ssid);
+        Serial.println(" ...");
+        WiFi.begin(ssid, password);
+        connecting = true;
+        lastAttempt = millis();
+    }
+    else if (millis() - lastAttempt > 15000)
+    {
+        Serial.println("WiFi connection timeout, will retry later.");
+        connecting = false;
+    }
+    return false;
 }
 
 /* Display flushing */
@@ -338,15 +349,32 @@ void updateChartRange()
 // task循环执行的函数
 static void task_cb(lv_task_t* task)
 {
-    if (WiFi.status() != WL_CONNECTED)
+    // 每次都要调用 connectWiFi：未连接时发起连接，已连接时切换页面
+    if (!connectWiFi())
     {
-        connectWiFi();
+        return;
+    }
+    // WiFi 首次连接后需要登录爱快获取 cookie
+    static bool ikuaiLoggedIn = false;
+    static unsigned long lastLoginAttempt = 0;
+    if (isIkuai && !ikuaiLoggedIn)
+    {
         lv_label_set_text(ip_label, WiFi.localIP().toString().c_str());
-        if (isIkuai)
+        // 每 5 秒重试一次登录，避免频繁请求
+        if (millis() - lastLoginAttempt >= 5000)
         {
-            //爱快登录认证
-            GetIkuaiInfo("login", netChartData, ikuaiToken);
+            lastLoginAttempt = millis();
+            String loginPayload = buildIkuaiLoginPayload(ikuaiUsername, ikuaiPassword);
+            if (GetIkuaiInfo("login", netChartData, loginPayload))
+            {
+                if (netChartData.cookie != "")
+                {
+                    ikuaiLoggedIn = true;
+                    Serial.println("iKuai login success, cookie saved.");
+                }
+            }
         }
+        return; // 登录完成前不请求数据
     }
     if (isIkuai)
     {
@@ -388,7 +416,6 @@ static void task_cb(lv_task_t* task)
 void setup()
 {
     Serial.begin(921600); /* prepare for possible serial debug */
-    srand((unsigned)time(NULL));
 
     lv_init();
 
@@ -429,9 +456,9 @@ void setup()
     lv_obj_set_style_local_bg_color(bg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, bg_color);
     lv_obj_set_size(bg, LV_HOR_RES_MAX, LV_VER_RES_MAX);
 
-    // 显示ip地址
+    // 显示ip地址（WiFi未连接时先显示占位文字）
     ip_label = lv_label_create(monitor_page, NULL);
-    lv_label_set_text(ip_label, WiFi.localIP().toString().c_str());
+    lv_label_set_text(ip_label, "Connecting...");
     // lv_label_set_text(ip_label, "192.168.100.199");
     lv_obj_set_pos(ip_label, 10, 220);
 
@@ -461,7 +488,7 @@ void setup()
     lv_obj_set_style_local_text_color(upload_label, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_RED);
     lv_obj_set_pos(upload_label, 10, 18);
 
-    lv_obj_t* down_label = lv_label_create(monitor_page, NULL);
+    down_label = lv_label_create(monitor_page, NULL);
     lv_obj_add_style(down_label, LV_LABEL_PART_MAIN, &iconfont);
     lv_label_set_text(down_label, CUSTOM_SYMBOL_DOWNLOAD);
     speed_label_color = lv_color_hex(0x838a99);

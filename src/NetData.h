@@ -3,8 +3,11 @@
 
 #include <ESP8266WiFi.h>
 #include <ArduinoJson.h>
+#include <MD5Builder.h>
+#include <base64.h>
 #include <string>
 
+// 爱快路由器管理地址（请按实际环境修改，常见为 10.1.1.1 或 192.168.1.1）
 const char* SERVER_ADDRESS = "10.1.1.1";
 
 class NetChartData
@@ -23,7 +26,7 @@ public:
     String group;
     String options_0;
     String options_1;
-    static String cookie;
+    String cookie;
     double up_speed;
     double down_speed;
     double cpu_usage;
@@ -42,14 +45,35 @@ public:
     double max;
 };
 
-// 在类外部定义静态成员变量 cookie，初始化为 ""
-String NetChartData::cookie = "";
+
+// 根据用户名和密码生成爱快登录 JSON（passwd=MD5密码，pass=base64("salt_11"+密码)）
+String buildIkuaiLoginPayload(const char* username, const char* password)
+{
+    MD5Builder md5;
+    md5.begin();
+    md5.add(password);
+    md5.calculate();
+    String passwdHash = md5.toString();
+
+    String passPlain = String("salt_11") + password;
+    String passEncoded = base64::encode(passPlain);
+
+    DynamicJsonDocument doc(256);
+    doc["username"] = username;
+    doc["passwd"] = passwdHash;
+    doc["pass"] = passEncoded;
+    doc["remember_password"] = "true";
+
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
 
 void parseNetDataResponse(WiFiClient& client, NetChartData& data)
 {
     // Stream& input;
 
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(8192);
 
     DeserializationError error = deserializeJson(doc, client);
 
@@ -83,16 +107,24 @@ void parseNetDataResponse(WiFiClient& client, NetChartData& data)
     data.points = doc["points"]; // 2
     data.format = doc["format"].as<String>(); // "array"
 
-    JsonArray db_points_per_tier = doc["db_points_per_tier"];
-    data.result = doc["result"];
     data.min = doc["min"]; // 2.1594684
     data.max = doc["max"]; // 3.7468776
-    double free = doc["result"]["data"][0][1];
-    double used = doc["result"]["data"][0][2];
-    double cached = doc["result"]["data"][0][3];
-    double buffers = doc["result"]["data"][0][4];
 
-    data.mem_usage = 100 * (used) / (free + used + buffers + cached);
+    // 计算内存使用率（仅当数据包含足够维度时）
+    JsonArray memData = doc["result"]["data"][0];
+    data.mem_usage = 0;
+    if (memData.size() >= 5)
+    {
+        double free = memData[1];
+        double used = memData[2];
+        double cached = memData[3];
+        double buffers = memData[4];
+        double total = free + used + buffers + cached;
+        if (total > 0)
+        {
+            data.mem_usage = 100 * used / total;
+        }
+    }
 }
 
 /**
@@ -152,7 +184,7 @@ void parseIkuaiResponse(WiFiClient& client, NetChartData& data)
 {
     // Stream& input;
 
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(8192);
 
     if (client.find("\r\n\r\n"))
     {
@@ -199,7 +231,7 @@ void parseIkuaiResponse(WiFiClient& client, NetChartData& data)
 }
 
 
-void ParseCookie(WiFiClient client, NetChartData data)
+void ParseCookie(WiFiClient& client, NetChartData& data)
 {
     // Read response and extract cookie
     Serial.println("----解析cookie");
@@ -212,7 +244,7 @@ void ParseCookie(WiFiClient client, NetChartData data)
             int end = line.indexOf(';');
             const String cookie = line.substring(start + 1, end);
             Serial.println("Cookie: ");
-            NetChartData::cookie = cookie;
+            data.cookie = cookie;
             Serial.println(cookie);
             client.stop();
         }
@@ -239,7 +271,7 @@ bool GetIkuaiInfo(String chartID, NetChartData& data, String postData)
         "Cache-Control: no-cache\r\n" +
         "Content-Length: " + postData.length() + "\r\n" +
         "Content-Type: text/plain\r\n" +
-        "Cookie: sess_key=" + NetChartData::cookie + "\r\n" +
+        "Cookie: sess_key=" + data.cookie + "\r\n" +
         "Accept: application/json, text/plain, */*\r\n" +
         "Connection: close\r\n\r\n" +
         postData;
