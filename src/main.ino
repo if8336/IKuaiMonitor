@@ -1,21 +1,17 @@
+#include "DeviceConfig.h"
+#include "WifiManager.h"
+#include "WebConfig.h"
+#include "GuidePage.h"
+
 #include <lvgl.h>
 #include <TFT_eSPI.h>
-#include <string>
 #include <ESP8266WiFi.h>
 
 #include "NetData.h"
-
-using namespace std;
+#include "Ws2812Status.h"
 
 //是否通过爱快接口获得数据
 constexpr bool isIkuai = true;
-// 连接WiFi名（请改为你的 WiFi 名称）
-const char* ssid = "YourWiFi-SSID";
-// 连接WiFi密码（请改为你的 WiFi 密码）
-const char* password = "your-wifi-password";
-// 爱快路由器登录凭据（请改为你的账号密码）
-const char* ikuaiUsername = "admin";
-const char* ikuaiPassword = "your-password";
 
 // extern lv_font_t my_font_name;
 LV_FONT_DECLARE(tencent_w7_22)
@@ -23,7 +19,8 @@ LV_FONT_DECLARE(tencent_w7_24)
 
 TFT_eSPI tft = TFT_eSPI(); /* TFT instance */
 static lv_disp_buf_t disp_buf;
-static lv_color_t buf[LV_HOR_RES_MAX * 10];
+// 5 行缓冲：3 行会出现整屏横向撕裂带，10 行在 ESP8266 上太吃 RAM
+static lv_color_t buf[LV_HOR_RES_MAX * 5];
 
 // 定义页面
 static lv_obj_t* login_page = NULL;
@@ -48,8 +45,18 @@ static lv_obj_t *ip_label;
 static lv_style_t arc_indic_style;
 static lv_obj_t *chart;
 
+static bool ikuaiLoggedIn = false;
+static bool ikuaiLoginFailed = false;
+static bool ikuaiConnectionLost = false;
+static uint8_t ikuaiLoginAttempts = 0;
+static uint8_t ikuaiDataFailCount = 0;
+static const uint8_t IKUAI_FAIL_THRESHOLD = 3;
+static const uint8_t IKUAI_DATA_FAIL_THRESHOLD = 2;
+static const unsigned long IKUAI_RETRY_INTERVAL_MS = 5000;
+
 static lv_chart_series_t *ser1;
 static lv_chart_series_t *ser2;
+static bool monitorPageBuilt = false;
 
 NetChartData netChartData;
 
@@ -97,7 +104,7 @@ void setupPages()
     lv_obj_set_hidden(monitor_page, true);
 }
 
-// 设置login_page显示组件
+// 设置login_page显示组件（WiFi 连接中转圈）
 void initLoginPage()
 {
     lv_style_t login_spinner_style;
@@ -108,45 +115,166 @@ void initLoginPage()
 
     lv_obj_t *preload = lv_spinner_create(login_page, NULL);
     lv_obj_set_size(preload, 100, 100);
-    lv_obj_align(preload, NULL, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(preload, NULL, LV_ALIGN_CENTER, 0, -10);
+
+    lv_obj_t *status_label = lv_label_create(login_page, NULL);
+    lv_label_set_text(status_label, "正在连接WiFi...");
+    lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, lv_color_hex(0x838a99));
+    lv_obj_set_style_local_text_font(status_label, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, &guide_font_16);
+    lv_obj_align(status_label, preload, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 }
 
-// 连接WiFi（非阻塞，带15秒超时）
-bool connectWiFi()
+static bool needsConfigPortal()
 {
-    // WiFi 已连接时切换页面并返回
-    if (WiFi.status() == WL_CONNECTED)
+    if (needsWifiSetup() || isWifiConnectionFailed() || isWifiSignalLost())
     {
-        static bool pageSwitched = false;
-        if (!pageSwitched)
-        {
-            pageSwitched = true;
-            lv_obj_set_hidden(login_page, true);
-            lv_obj_set_hidden(monitor_page, false);
-            Serial.println("");
-            Serial.println("Connection established!");
-            Serial.print("IP address:    ");
-            Serial.println(WiFi.localIP().toString().c_str());
-        }
         return true;
     }
-    static unsigned long lastAttempt = 0;
-    static bool connecting = false;
-    if (!connecting)
+    if (isIkuai && isWifiReady() && (ikuaiLoginFailed || ikuaiConnectionLost))
     {
-        Serial.print("Connecting to ");
-        Serial.print(ssid);
-        Serial.println(" ...");
-        WiFi.begin(ssid, password);
-        connecting = true;
-        lastAttempt = millis();
-    }
-    else if (millis() - lastAttempt > 15000)
-    {
-        Serial.println("WiFi connection timeout, will retry later.");
-        connecting = false;
+        return true;
     }
     return false;
+}
+
+static bool isNormalMonitorMode()
+{
+    if (!isWifiReady())
+    {
+        return false;
+    }
+    if (isIkuai && !ikuaiLoggedIn)
+    {
+        return false;
+    }
+    return true;
+}
+
+static void destroyMonitorPage()
+{
+    if (!monitorPageBuilt || monitor_page == NULL)
+    {
+        return;
+    }
+
+    lv_obj_clean(monitor_page);
+    upload_label = NULL;
+    down_label = NULL;
+    up_speed_label = NULL;
+    up_speed_unit_label = NULL;
+    down_speed_label = NULL;
+    down_speed_unit_label = NULL;
+    cpu_bar = NULL;
+    cpu_value_label = NULL;
+    mem_bar = NULL;
+    mem_value_label = NULL;
+    temp_value_label = NULL;
+    temperature_arc = NULL;
+    ip_label = NULL;
+    chart = NULL;
+    ser1 = NULL;
+    ser2 = NULL;
+    monitorPageBuilt = false;
+    lv_obj_set_hidden(monitor_page, true);
+    Serial.println("Monitor page destroyed to save RAM");
+}
+
+static void buildMonitorPage();
+static void manageRuntimeServices();
+
+static void updateDeviceUi()
+{
+    manageRuntimeServices();
+
+    const bool wifiReady = isWifiReady();
+
+    if (needsWifiSetup())
+    {
+        lv_obj_set_hidden(login_page, true);
+        lv_obj_set_hidden(monitor_page, true);
+        showGuidePage(GUIDE_WIFI_SETUP);
+        return;
+    }
+
+    if (isWifiSignalLost())
+    {
+        lv_obj_set_hidden(login_page, true);
+        lv_obj_set_hidden(monitor_page, true);
+        showGuidePage(GUIDE_WIFI_LOST);
+        return;
+    }
+
+    if (!wifiReady && isWifiConnectionFailed())
+    {
+        lv_obj_set_hidden(login_page, true);
+        lv_obj_set_hidden(monitor_page, true);
+        showGuidePage(GUIDE_WIFI_FAILED);
+        return;
+    }
+
+    if (wifiReady && isIkuai && !ikuaiLoggedIn && ikuaiConnectionLost)
+    {
+        lv_obj_set_hidden(login_page, true);
+        lv_obj_set_hidden(monitor_page, true);
+        showGuidePage(GUIDE_IKUAI_LOST);
+        return;
+    }
+
+    if (wifiReady && isIkuai && !ikuaiLoggedIn && ikuaiLoginFailed)
+    {
+        lv_obj_set_hidden(login_page, true);
+        lv_obj_set_hidden(monitor_page, true);
+        showGuidePage(GUIDE_IKUAI_FAILED);
+        return;
+    }
+
+    hideGuidePage();
+
+    if (!wifiReady)
+    {
+        lv_obj_set_hidden(login_page, false);
+        lv_obj_set_hidden(monitor_page, true);
+        return;
+    }
+
+    if (isIkuai && !ikuaiLoggedIn)
+    {
+        lv_obj_set_hidden(login_page, false);
+        lv_obj_set_hidden(monitor_page, true);
+        return;
+    }
+
+    lv_obj_set_hidden(login_page, true);
+    lv_obj_set_hidden(monitor_page, false);
+}
+
+static void manageRuntimeServices()
+{
+    if (isNormalMonitorMode())
+    {
+        stopWebConfig();
+        if (!monitorPageBuilt)
+        {
+            buildMonitorPage();
+        }
+        return;
+    }
+
+    if (needsConfigPortal())
+    {
+        startWebConfig();
+        if (monitorPageBuilt)
+        {
+            destroyMonitorPage();
+        }
+        return;
+    }
+
+    stopWebConfig();
+    if (monitorPageBuilt)
+    {
+        destroyMonitorPage();
+    }
 }
 
 /* Display flushing */
@@ -213,35 +341,99 @@ lv_coord_t updateNetSeries(lv_coord_t* series, double speed)
     }
     series[9] = (lv_coord_t)speed;
     if (local_max < series[9])
-        local_max = series[9];
-
-    Serial.print(speed);
-    Serial.print("->");
-    Serial.print(series[9]);
-    Serial.print("    |");
-    for (int i = 0; i < 10; i++)
     {
-        Serial.print(series[i]);
-        Serial.print(" ");
+        local_max = series[9];
     }
-    Serial.println();
-
     return local_max;
 }
 
-void getIkuaiUsage()
+static bool fetchIkuaiUsage()
 {
-    GetIkuaiInfo("call", netChartData,
-                 "{\"func_name\":\"sysstat\",\"action\":\"show\",\"param\":{\"TYPE\":\"verinfo,cpu,memory,stream,cputemp\"}}");
+    static const char SYSSTAT_PAYLOAD[] =
+        "{\"func_name\":\"sysstat\",\"action\":\"show\",\"param\":{\"TYPE\":\"cpu,memory,stream,cputemp\"}}";
+    const bool ok = GetIkuaiInfo("call", netChartData, SYSSTAT_PAYLOAD);
+    if (!ok)
+    {
+        return false;
+    }
     cpu_usage = netChartData.cpu_usage;
     temp_value = netChartData.temp_value;
     mem_usage = netChartData.mem_usage;
-    up_speed = netChartData.up_speed / 1024;
-    down_speed = netChartData.down_speed / 1024;
+    up_speed = netChartData.up_speed / 1024.0;
+    down_speed = netChartData.down_speed / 1024.0;
+    if (!monitorPageBuilt || chart == NULL)
+    {
+        return true;
+    }
     down_speed_max = updateNetSeries(download_serise, down_speed);
     lv_chart_set_points(chart, ser2, download_serise);
     up_speed_max = updateNetSeries(upload_serise, up_speed);
     lv_chart_set_points(chart, ser1, upload_serise);
+    return true;
+}
+
+static void markIkuaiConnectionLost()
+{
+    ikuaiLoggedIn = false;
+    ikuaiConnectionLost = true;
+    ikuaiDataFailCount = 0;
+    clearSessKey(netChartData);
+    Serial.println("iKuai connection lost, retrying in background.");
+    updateDeviceUi();
+}
+
+static void markIkuaiCredentialFailed()
+{
+    ikuaiLoggedIn = false;
+    ikuaiLoginFailed = true;
+    ikuaiConnectionLost = false;
+    ikuaiLoginAttempts = 0;
+    clearSessKey(netChartData);
+    Serial.println("iKuai credential rejected, stop retry and show guide.");
+    updateDeviceUi();
+}
+
+static bool tryIkuaiLogin()
+{
+    clearSessKey(netChartData);
+    netChartData.lastLoginResult = -1;
+    Serial.print("iKuai user: ");
+    Serial.println(deviceConfig.ikuaiUsername);
+    Serial.print("iKuai password length: ");
+    Serial.println(strlen(deviceConfig.ikuaiPassword));
+    if (strlen(deviceConfig.ikuaiPassword) == 0)
+    {
+        Serial.println("iKuai password empty, show guide.");
+        markIkuaiCredentialFailed();
+        return false;
+    }
+    String loginPayload = buildIkuaiLoginPayload(deviceConfig.ikuaiUsername, deviceConfig.ikuaiPassword);
+    if (!GetIkuaiInfo("login", netChartData, loginPayload.c_str()))
+    {
+        Serial.println("iKuai login request failed.");
+        if (isIkuaiCredentialError(netChartData.lastLoginResult))
+        {
+            markIkuaiCredentialFailed();
+        }
+        return false;
+    }
+    if (!hasSessKey(netChartData))
+    {
+        Serial.println("iKuai login failed: no sess_key.");
+        if (isIkuaiCredentialError(netChartData.lastLoginResult))
+        {
+            markIkuaiCredentialFailed();
+        }
+        return false;
+    }
+    ikuaiLoggedIn = true;
+    ikuaiLoginFailed = false;
+    ikuaiConnectionLost = false;
+    ikuaiLoginAttempts = 0;
+    ikuaiDataFailCount = 0;
+    Serial.println("iKuai login success, cookie saved.");
+    updateDeviceUi();
+    return true;
 }
 
 void getNetworkReceived()
@@ -284,63 +476,62 @@ void getTemperature()
 
 void updateNetworkInfoLabel()
 {
-    if (up_speed < 100.0)
+    double upDisplay = up_speed;
+    double downDisplay = down_speed;
+
+    if (upDisplay < 100.0)
     {
-        // < 99.99 K/S
-        lv_label_set_text_fmt(up_speed_label, "%.2f", up_speed);
+        lv_label_set_text_fmt(up_speed_label, "%.2f", upDisplay);
         lv_label_set_text(up_speed_unit_label, "K/s");
     }
-    else if (up_speed < 1000.0)
+    else if (upDisplay < 1000.0)
     {
-        // 999.9 K/S
-        lv_label_set_text_fmt(up_speed_label, "%.1f", up_speed);
+        lv_label_set_text_fmt(up_speed_label, "%.1f", upDisplay);
         lv_label_set_text(up_speed_unit_label, "K/s");
     }
-    else if (up_speed < 100000.0)
+    else if (upDisplay < 100000.0)
     {
-        // 99.99 M/S
-        up_speed /= 1024.0;
-        lv_label_set_text_fmt(up_speed_label, "%.2f", up_speed);
+        upDisplay /= 1024.0;
+        lv_label_set_text_fmt(up_speed_label, "%.2f", upDisplay);
         lv_label_set_text(up_speed_unit_label, "M/s");
     }
-    else if (up_speed < 1000000.0)
+    else if (upDisplay < 1000000.0)
     {
-        // 999.9 M/S
-        up_speed = up_speed / 1024.0;
-        lv_label_set_text_fmt(up_speed_label, "%.1f", up_speed);
+        upDisplay /= 1024.0;
+        lv_label_set_text_fmt(up_speed_label, "%.1f", upDisplay);
         lv_label_set_text(up_speed_unit_label, "M/s");
     }
 
-    if (down_speed < 100.0)
+    if (downDisplay < 100.0)
     {
-        // < 99.99 K/S
-        lv_label_set_text_fmt(down_speed_label, "%.2f", down_speed);
+        lv_label_set_text_fmt(down_speed_label, "%.2f", downDisplay);
         lv_label_set_text(down_speed_unit_label, "K/s");
     }
-    else if (down_speed < 1000.0)
+    else if (downDisplay < 1000.0)
     {
-        // 999.9 K/S
-        lv_label_set_text_fmt(down_speed_label, "%.1f", down_speed);
+        lv_label_set_text_fmt(down_speed_label, "%.1f", downDisplay);
         lv_label_set_text(down_speed_unit_label, "K/s");
     }
-    else if (down_speed < 100000.0)
+    else if (downDisplay < 100000.0)
     {
-        // 99.99 M/S
-        down_speed /= 1024.0;
-        lv_label_set_text_fmt(down_speed_label, "%.2f", down_speed);
+        downDisplay /= 1024.0;
+        lv_label_set_text_fmt(down_speed_label, "%.2f", downDisplay);
         lv_label_set_text(down_speed_unit_label, "M/s");
     }
-    else if (down_speed < 1000000.0)
+    else if (downDisplay < 1000000.0)
     {
-        // 999.9 M/S
-        down_speed = down_speed / 1024.0;
-        lv_label_set_text_fmt(down_speed_label, "%.1f", down_speed);
+        downDisplay /= 1024.0;
+        lv_label_set_text_fmt(down_speed_label, "%.1f", downDisplay);
         lv_label_set_text(down_speed_unit_label, "M/s");
     }
 }
 
 void updateChartRange()
 {
+    if (!monitorPageBuilt || chart == NULL)
+    {
+        return;
+    }
     lv_coord_t max_speed = max(down_speed_max, up_speed_max);
     max_speed = max(max_speed, (lv_coord_t)16);
     lv_chart_set_range(chart, 0, (lv_coord_t)(max_speed * 1.1));
@@ -349,36 +540,63 @@ void updateChartRange()
 // task循环执行的函数
 static void task_cb(lv_task_t* task)
 {
-    // 每次都要调用 connectWiFi：未连接时发起连接，已连接时切换页面
-    if (!connectWiFi())
+    updateWifiConnection();
+    updateDeviceUi();
+
+    if (ip_label != NULL)
+    {
+        lv_label_set_text(ip_label, getDisplayIp());
+    }
+
+    static unsigned long lastIkuaiRetry = 0;
+    const bool wifiReady = isWifiReady();
+
+    if (!wifiReady)
     {
         return;
     }
-    // WiFi 首次连接后需要登录爱快获取 cookie
-    static bool ikuaiLoggedIn = false;
-    static unsigned long lastLoginAttempt = 0;
+
     if (isIkuai && !ikuaiLoggedIn)
     {
-        lv_label_set_text(ip_label, WiFi.localIP().toString().c_str());
-        // 每 5 秒重试一次登录，避免频繁请求
-        if (millis() - lastLoginAttempt >= 5000)
+        // 凭据错误已确认，等待用户通过 Web 重新配置，不再重试
+        if (ikuaiLoginFailed)
         {
-            lastLoginAttempt = millis();
-            String loginPayload = buildIkuaiLoginPayload(ikuaiUsername, ikuaiPassword);
-            if (GetIkuaiInfo("login", netChartData, loginPayload))
+            return;
+        }
+
+        if (millis() - lastIkuaiRetry >= IKUAI_RETRY_INTERVAL_MS)
+        {
+            lastIkuaiRetry = millis();
+            if (tryIkuaiLogin())
             {
-                if (netChartData.cookie != "")
+                return;
+            }
+            if (!ikuaiConnectionLost)
+            {
+                ikuaiLoginAttempts++;
+                if (ikuaiLoginAttempts >= IKUAI_FAIL_THRESHOLD)
                 {
-                    ikuaiLoggedIn = true;
-                    Serial.println("iKuai login success, cookie saved.");
+                    ikuaiLoginFailed = true;
+                    Serial.println("iKuai login failed, show guide page.");
+                    updateDeviceUi();
                 }
             }
         }
-        return; // 登录完成前不请求数据
+        return;
     }
+
     if (isIkuai)
     {
-        getIkuaiUsage();
+        if (!fetchIkuaiUsage())
+        {
+            ikuaiDataFailCount++;
+            if (ikuaiDataFailCount >= IKUAI_DATA_FAIL_THRESHOLD)
+            {
+                markIkuaiConnectionLost();
+            }
+            return;
+        }
+        ikuaiDataFailCount = 0;
     }
     else
     {
@@ -389,16 +607,20 @@ static void task_cb(lv_task_t* task)
         getNetworkSent();
     }
 
+    if (!monitorPageBuilt || chart == NULL)
+    {
+        return;
+    }
 
     updateChartRange();
     lv_chart_refresh(chart);
 
     updateNetworkInfoLabel();
 
-    lv_bar_set_value(cpu_bar, cpu_usage, LV_ANIM_OFF);
-    lv_label_set_text_fmt(cpu_value_label, "%2.1f%%", cpu_usage);
+    lv_bar_set_value(cpu_bar, (int16_t)(cpu_usage + 0.5), LV_ANIM_OFF);
+    lv_label_set_text_fmt(cpu_value_label, "%.1f%%", cpu_usage);
 
-    lv_bar_set_value(mem_bar, mem_usage, LV_ANIM_OFF);
+    lv_bar_set_value(mem_bar, (int16_t)(mem_usage + 0.5), LV_ANIM_OFF);
     lv_label_set_text_fmt(mem_value_label, "%2.0f%%", mem_usage);
 
     lv_label_set_text_fmt(temp_value_label, "%2.0f°C", temp_value);
@@ -408,14 +630,22 @@ static void task_cb(lv_task_t* task)
     lv_obj_add_style(temperature_arc, LV_ARC_PART_INDIC, &arc_indic_style);
     lv_arc_set_end_angle(temperature_arc, end_value);
 
-    // 测试内存泄漏
-    Serial.print("⚠ Left Memory:");
-    Serial.println(ESP.getFreeHeap());
+    // 内存监控（每 30 秒一次，避免串口刷屏）
+    static unsigned long lastHeapLog = 0;
+    if (millis() - lastHeapLog >= 30000)
+    {
+        lastHeapLog = millis();
+        Serial.print("Left Memory: ");
+        Serial.println(ESP.getFreeHeap());
+    }
 }
 
 void setup()
 {
     Serial.begin(921600); /* prepare for possible serial debug */
+
+    initWifiManager();
+    initWebConfig();
 
     lv_init();
 
@@ -426,7 +656,7 @@ void setup()
     tft.begin(); /* TFT init */
     tft.setRotation(0); /* Landscape orientation */
 
-    lv_disp_buf_init(&disp_buf, buf, NULL, LV_HOR_RES_MAX * 10);
+    lv_disp_buf_init(&disp_buf, buf, NULL, LV_HOR_RES_MAX * 5);
 
     /*Initialize the display*/
     lv_disp_drv_t disp_drv;
@@ -447,6 +677,21 @@ void setup()
     setupPages();
     initLoginPage();
 
+    lv_task_t* t = lv_task_create(task_cb, 1000, LV_TASK_PRIO_MID, &test_data);
+    (void)t;
+
+    initGuidePage(lv_scr_act());
+    updateDeviceUi();
+    initWs2812Status();
+}
+
+static void buildMonitorPage()
+{
+    if (monitorPageBuilt || monitor_page == NULL)
+    {
+        return;
+    }
+
     lv_obj_t* bg;
     bg = lv_obj_create(monitor_page, NULL);
     lv_obj_clean_style_list(bg, LV_OBJ_PART_MAIN);
@@ -456,9 +701,9 @@ void setup()
     lv_obj_set_style_local_bg_color(bg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, bg_color);
     lv_obj_set_size(bg, LV_HOR_RES_MAX, LV_VER_RES_MAX);
 
-    // 显示ip地址（WiFi未连接时先显示占位文字）
+    // 显示ip地址（WiFi未连接时显示 AP IP 或占位文字）
     ip_label = lv_label_create(monitor_page, NULL);
-    lv_label_set_text(ip_label, "Connecting...");
+    lv_label_set_text(ip_label, getDisplayIp());
     // lv_label_set_text(ip_label, "192.168.100.199");
     lv_obj_set_pos(ip_label, 10, 220);
 
@@ -530,16 +775,10 @@ void setup()
     lv_obj_align(chart, NULL, LV_ALIGN_CENTER, 0, -40);
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE); /*Show lines and points too*/
     lv_chart_set_range(chart, 0, 4096);
-    lv_chart_set_point_count(chart, 10); // 设置显示点数
-    lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
+    lv_chart_set_point_count(chart, 10);
+    // 数据队列由 upload_serise/download_serise 手动维护，不用 SHIFT 避免双重移位
+    lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_CIRCULAR);
 
-    /*Add a faded are effect*/
-    lv_obj_set_style_local_bg_opa(chart, LV_CHART_PART_SERIES, LV_STATE_DEFAULT, LV_OPA_50); /*Max. opa.*/
-    lv_obj_set_style_local_bg_grad_dir(chart, LV_CHART_PART_SERIES, LV_STATE_DEFAULT, LV_GRAD_DIR_VER);
-    lv_obj_set_style_local_bg_main_stop(chart, LV_CHART_PART_SERIES, LV_STATE_DEFAULT, 255); /*Max opa on the top*/
-    lv_obj_set_style_local_bg_grad_stop(chart, LV_CHART_PART_SERIES, LV_STATE_DEFAULT, 0); /*Transparent on the bottom*/
-
-    /*Add two data series*/
     ser1 = lv_chart_add_series(chart, LV_COLOR_RED);
     ser2 = lv_chart_add_series(chart, LV_COLOR_GREEN);
 
@@ -642,10 +881,20 @@ void setup()
     lv_obj_set_style_local_text_color(temp_value_label, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_pos(temp_value_label, 160, 170);
 
-    lv_task_t* t = lv_task_create(task_cb, 1000, LV_TASK_PRIO_MID, &test_data);
+    monitorPageBuilt = true;
+    lv_obj_set_hidden(monitor_page, false);
+    Serial.println("Monitor page built");
 }
 
 void loop()
 {
-    lv_task_handler(); /* let the GUI do its work */
+    if (isWebConfigActive())
+    {
+        handleWebConfig();
+    }
+    if (!isWebConfigBusy())
+    {
+        lv_task_handler();
+    }
+    updateWs2812Status(isIkuai, ikuaiLoggedIn);
 }
